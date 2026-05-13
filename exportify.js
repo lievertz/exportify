@@ -17,7 +17,9 @@ const utils = {
 		let code_challenge = btoa(String.fromCharCode(...new Uint8Array(hashed))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
 
 		localStorage.setItem('code_verifier', code_verifier) // save the random string secret
-		location = "https://accounts.spotify.com/authorize?client_id=d99b082b01d74d61a100c9a0e056380b" +
+		// client_id can be overridden via config.local.js (see config.local.example.js); default is the production app's id
+		let client_id = (typeof window !== 'undefined' && window.CONFIG?.spotify_client_id) || "d99b082b01d74d61a100c9a0e056380b"
+		location = "https://accounts.spotify.com/authorize?client_id=" + client_id +
 			"&redirect_uri=" + encodeURIComponent(location.origin) +
 			"&scope=playlist-read-private%20playlist-read-collaborative%20user-library-read" + // access to particular scopes of info defined here
 			"&response_type=code&code_challenge_method=S256&code_challenge=" + code_challenge
@@ -54,6 +56,192 @@ const utils = {
 		localStorage.clear() // otherwise when the page is reloaded it still just finds and uses the access_token
 		location = location.origin //let logout = open("https://www.spotify.com/logout"); setTimeout(() => {logout.close(); location = location.origin}, 1000)
 	}
+}
+
+// =====================================================================================
+// Enrichment: Spotify deprecated audio-features (and analysis, recommendations, related
+// artists, featured playlists) for new client apps in November 2024, so we pull
+// replacement data from third-party services keyed off the ISRC code each Spotify track
+// carries. Each service gets its own queue with conservative pacing and a circuit
+// breaker: if 5 calls in a row fail with anything other than a clean miss, we assume
+// something is structurally wrong (URL shape, service down, IP blocked) rather than
+// sporadic, and stop trying for that service. The other services keep going.
+// Note: browsers refuse to let JS override the User-Agent header, so requests go out
+// with the regular browser UA — which is exactly what the user asked for ("safe,
+// browser-like"). We honor each service's rate-limit guidance via minIntervalMs.
+// =====================================================================================
+const enrich = {
+	// Default transport: standard fetch, wrapping the Response in a shape the queue understands.
+	async fetchTransport(url, options) {
+		let r = await fetch(url, options)
+		return { ok: r.ok, status: r.status, retryAfter: parseInt(r.headers.get('Retry-After') || '0', 10), json: () => r.json() }
+	},
+
+	// JSONP transport: needed for services like Deezer that don't send Access-Control-Allow-Origin
+	// on their public API. We inject a <script> tag with a callback param; the response is JS that
+	// invokes our callback with the data. Bypasses CORS because <script> tags aren't same-origin
+	// restricted. No status codes available, so any failure (load error or timeout) just throws.
+	jsonpTransport(url) {
+		return new Promise((resolve, reject) => {
+			let cbName = 'exportify_jsonp_' + Math.random().toString(36).slice(2)
+			let script = document.createElement('script')
+			let cleanup = () => { try { delete window[cbName] } catch (_) {}; script.remove() }
+			let timer = setTimeout(() => { cleanup(); reject(new Error('JSONP timeout')) }, 15000)
+			window[cbName] = data => { clearTimeout(timer); cleanup()
+				resolve({ ok: true, status: 200, retryAfter: 0, json: () => Promise.resolve(data) }) }
+			script.onerror = () => { clearTimeout(timer); cleanup(); reject(new Error('JSONP load failed')) }
+			script.src = url + (url.includes('?') ? '&' : '?') + 'output=jsonp&callback=' + cbName
+			document.head.appendChild(script)
+		})
+	},
+
+	makeQueue({ name, minIntervalMs, maxConsecutiveFailures = 5, maxRetries = 2, transport }) {
+		transport = transport || enrich.fetchTransport
+		let lastStart = 0
+		let consecutiveFailures = 0
+		let aborted = false
+
+		async function paced() {
+			let wait = Math.max(0, lastStart + minIntervalMs - Date.now())
+			if (wait > 0) await new Promise(r => setTimeout(r, wait))
+			lastStart = Date.now()
+		}
+
+		return {
+			name,
+			get aborted() { return aborted },
+			async call(url, options = {}) {
+				if (aborted) return null
+				await paced()
+				for (let attempt = 0; attempt <= maxRetries; attempt++) {
+					let response, err
+					try { response = await transport(url, options) }
+					catch (e) { err = e } // network-level / CORS / JSONP load failure
+
+					if (response?.ok) { consecutiveFailures = 0; return response.json() }
+					if (response?.status === 404) { consecutiveFailures = 0; return null } // clean miss; not a failure
+					if (response?.status === 429) { // honor service's retry-after on rate limit
+						await new Promise(r => setTimeout(r, (response.retryAfter || 2) * 1000))
+						continue
+					}
+					if (attempt < maxRetries) { // sporadic failure: backoff and retry
+						await new Promise(r => setTimeout(r, 500 * (attempt + 1)))
+						continue
+					}
+					// exhausted retries -> count as a real failure for the circuit breaker
+					consecutiveFailures++
+					if (consecutiveFailures >= maxConsecutiveFailures) {
+						aborted = true
+						let detail = err ? err.message : 'HTTP ' + (response?.status ?? 'unknown')
+						enrich.warn(name + ' enrichment aborted after ' + consecutiveFailures +
+							' consecutive failures (last: ' + detail + '). Other columns still export.')
+					}
+					return null
+				}
+			},
+		}
+	},
+
+	warn(msg) {
+		error.innerHTML += '<p><i class="fa fa-exclamation-triangle" style="font-size: 20px; margin-right: 8px"></i>' + msg + '</p>'
+	},
+
+	// Deezer's /track/isrc:<isrc> endpoint doesn't send Access-Control-Allow-Origin on responses,
+	// so plain fetch fails CORS. We use JSONP via <script> injection instead, which sidesteps
+	// CORS entirely. Misses come back as HTTP 200 with {error:{code:800}}, so we sniff the body
+	// rather than rely on status codes.
+	async deezer(isrcs, setStatus) {
+		if (isrcs.length === 0) return {}
+		let q = enrich.makeQueue({ name: 'Deezer', minIntervalMs: 150, transport: enrich.jsonpTransport })
+		let out = {}
+		let i = 0
+		for (let isrc of isrcs) {
+			if (q.aborted) break
+			setStatus?.('Deezer ' + (++i) + '/' + isrcs.length)
+			let d = await q.call('https://api.deezer.com/track/isrc:' + encodeURIComponent(isrc))
+			if (d && !d.error) out[isrc] = { bpm: d.bpm, gain: d.gain }
+		}
+		return out
+	},
+
+	// MusicBrainz asks for ≤1 req/sec. We resolve ISRC → recording, then pluck the first
+	// recording and its tags/genres. The recording's MBID is what feeds AcousticBrainz.
+	async musicbrainz(isrcs, setStatus) {
+		if (isrcs.length === 0) return {}
+		let q = enrich.makeQueue({ name: 'MusicBrainz', minIntervalMs: 1100 })
+		let out = {}
+		let i = 0
+		for (let isrc of isrcs) {
+			if (q.aborted) break
+			setStatus?.('MusicBrainz ' + (++i) + '/' + isrcs.length)
+			// `genres` is not a valid inc parameter on the /isrc/ endpoint (returns 400) — only `tags` is.
+			let data = await q.call('https://musicbrainz.org/ws/2/isrc/' + encodeURIComponent(isrc) + '?inc=tags&fmt=json',
+				{ headers: { 'Accept': 'application/json' } })
+			if (data?.recordings?.length > 0) {
+				let r = data.recordings[0] // first recording match; multiple MBIDs can share an ISRC across releases
+				let tagNames = (r.tags || []).sort((a, b) => (b.count || 0) - (a.count || 0)).slice(0, 5).map(t => t.name)
+				out[isrc] = { mbid: r.id, tags: tagNames.join(';') }
+			}
+		}
+		return out
+	},
+
+	// AcousticBrainz supports bulk lookup of up to 25 MBIDs at a time across its low-level
+	// (raw signal features: bpm, key, loudness, etc.) and high-level (classifier outputs:
+	// mood, danceability, genre, etc.) endpoints. Submissions to AB stopped in 2022, so
+	// coverage falls off sharply for newer releases — but everything older is still there.
+	async acousticbrainz(mbids, setStatus) {
+		if (mbids.length === 0) return {}
+		let q = enrich.makeQueue({ name: 'AcousticBrainz', minIntervalMs: 250 })
+		let out = {}
+		let chunks = []
+		for (let i = 0; i < mbids.length; i += 25) chunks.push(mbids.slice(i, i + 25))
+		let done = 0
+		for (let chunk of chunks) {
+			if (q.aborted) break
+			setStatus?.('AcousticBrainz ' + done + '-' + (done + chunk.length) + '/' + mbids.length)
+			let ids = chunk.join(';')
+			let [low, high] = await Promise.all([
+				q.call('https://acousticbrainz.org/api/v1/low-level?recording_ids=' + ids),
+				q.call('https://acousticbrainz.org/api/v1/high-level?recording_ids=' + ids),
+			])
+			for (let mbid of chunk) {
+				// AB returns shape {mbid: {"0": {...}}} where "0" is the first submission for that MBID
+				let lo = low?.[mbid]?.['0']
+				let hi = high?.[mbid]?.['0']
+				if (!lo && !hi) continue
+				let hl = hi?.highlevel || {}
+				let pick = k => hl[k] ? hl[k].value + ' (' + (+hl[k].probability).toFixed(2) + ')' : '' // classifier verdict + confidence
+				out[mbid] = {
+					bpm: lo?.rhythm?.bpm,
+					key: lo?.tonal ? lo.tonal.key_key + ' ' + lo.tonal.key_scale : '',
+					avg_loudness: lo?.lowlevel?.average_loudness,
+					dynamic_complexity: lo?.lowlevel?.dynamic_complexity,
+					danceability: pick('danceability'),
+					mood_happy: pick('mood_happy'),
+					mood_sad: pick('mood_sad'),
+					mood_aggressive: pick('mood_aggressive'),
+					mood_relaxed: pick('mood_relaxed'),
+					mood_party: pick('mood_party'),
+					voice_instrumental: pick('voice_instrumental'),
+					tonal_atonal: pick('tonal_atonal'),
+					timbre: pick('timbre'),
+					genre_dortmund: pick('genre_dortmund'),
+					genre_rosamerica: pick('genre_rosamerica'),
+					gender: pick('gender'),
+				}
+			}
+			done += chunk.length
+		}
+		return out
+	},
+
+	// CSV-safe rendering. Numbers go raw; strings get quoted with embedded quotes doubled.
+	csvField(v) {
+		if (v === undefined || v === null || v === '') return ''
+		if (typeof v === 'number') return v
+		return '"' + String(v).replace(/"/g, '""') + '"'
+	},
 }
 
 // The table of this user's playlists, to be displayed mid-page in the playlistsContainer
@@ -153,15 +341,17 @@ let PlaylistExporter = {
 	// Take the access token string and playlist object, generate a csv from it, and when that data is resolved and
 	// returned, save to a file.
 	async export(playlist, row) {
-		document.getElementById("export"+row).innerHTML = '<i class="fa fa-circle-o-notch fa-spin"></i> Exporting' // spinner on button
+		let btn = document.getElementById("export"+row)
+		let setStatus = s => { btn.innerHTML = '<i class="fa fa-circle-o-notch fa-spin"></i> ' + s }
+		setStatus('Exporting') // spinner on button
 		try {
-			let csv = await this.csvData(playlist)
+			let csv = await this.csvData(playlist, setStatus)
 			saveAs(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" }), this.fileName(playlist) + ".csv")
 		} catch (e) {
 			error.innerHTML += "Couldn't export " + playlist.name + ". Encountered <tt>" + e + "</tt><br/>" + e.stack +
 					'<br/>Please <a href="https://github.com/pavelkomarov/exportify/issues">let us know</a>.'
 		} finally { // change back the export button's text
-			document.getElementById("export"+row).innerHTML = '<i class="fa fa-download"></i> Export'
+			btn.innerHTML = '<i class="fa fa-download"></i> Export'
 		}
 	},
 
@@ -172,8 +362,9 @@ let PlaylistExporter = {
 		let zip = new JSZip()
 
 		for (let playlist of playlists) {
+			let setStatus = s => { exportAll.innerHTML = '<i class="fa fa-circle-o-notch fa-spin"></i> ' + playlist.name + ': ' + s }
 			try {
-				let csv = await this.csvData(playlist)
+				let csv = await this.csvData(playlist, setStatus)
 				let fileName = this.fileName(playlist)
 				while (zip.file(fileName + ".csv")) { fileName += "_" } // Add underscores if the file already exists so playlists with duplicate names don't overwrite each other.
 				zip.file(fileName + ".csv", csv)
@@ -194,8 +385,9 @@ let PlaylistExporter = {
 
 	// This is where the magic happens. The access token gives us permission to query this info from Spotify, and the
 	// playlist object gives us all the information we need to start asking for songs.
-	async csvData(playlist) {
+	async csvData(playlist, setStatus = () => {}) {
 		let increment = playlist.name == "Liked Songs" ? 50 : 100 // Can max call for only 50 tracks at a time vs 100 for playlists
+		setStatus('Fetching tracks')
 
 		// Make asynchronous API calls for 100 songs at a time, and put the results (all Promises) in a list.
 		let requests = []
@@ -206,12 +398,14 @@ let PlaylistExporter = {
 		// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/all
 		let artist_ids = new Set()
 		let album_ids = new Set()
+		let track_isrcs = {} // uri -> ISRC, the cross-service key we'll use for Deezer / MusicBrainz / AcousticBrainz
 		let data_promise = Promise.all(requests).then(responses => { // Gather all the data from the responses in a table.
 			return responses.map(response => { // apply to all responses
 				return response.items.map(song => { // apply to all songs in each response
 					// Safety check! If there are artists/album listed and they have non-null identifier, add them to the sets
 					song.track?.artists?.forEach(a => { if (a && a.id) { artist_ids.add(a.id) } })
 					if (song.track?.album && song.track.album.id) { album_ids.add(song.track.album.id) }
+					if (song.track?.uri && song.track.external_ids?.isrc) { track_isrcs[song.track.uri] = song.track.external_ids.isrc }
 					// Commas in various fields can throw off csv, so surround with quotes. Quotes are escaped by doubling "".
 					// For robustness to missing data, null-checking question marks abound. Artists are separated with
 					// semicolons so commas can be preserved in their names without confusion.
@@ -252,27 +446,25 @@ let PlaylistExporter = {
 			})
 		})
 
-		// Make queries for song audio features, 100 songs at a time.
-		let features_promise = Promise.all([data_promise, genre_promise, album_promise]).then(values => {
-			let data = values[0]
-			let songs_promises = data.map((chunk, i) => { // remember data is an array of arrays, each subarray 100 tracks
-				let ids = chunk.map(song => song[2]?.split(':')[2]).join(',') // the id lives in the third position, at the end of spotify:track:id
-				return utils.apiCall('https://api.spotify.com/v1/audio-features?ids='+ids, 100*i)
-			})
-			return Promise.all(songs_promises).then(responses => {
-				return responses.map(response => { // for each response
-					return response?.audio_features?.map(feats => {
-						return [feats?.danceability, feats?.energy, feats?.key, feats?.loudness, feats?.mode,
-							feats?.speechiness, feats?.acousticness, feats?.instrumentalness, feats?.liveness, feats?.valence,
-							feats?.tempo, feats?.time_signature] // Safety-checking question marks
-					})
-				})
-			})
+		// Pull external enrichment data keyed by ISRC. Runs sequentially across services so we
+		// don't pile concurrent traffic on top of three different rate-limited backends. Each
+		// service has its own circuit breaker — failures in one don't affect the others.
+		let enrich_promise = Promise.all([data_promise, genre_promise, album_promise]).then(async () => {
+			let unique_isrcs = [...new Set(Object.values(track_isrcs))]
+			let deezer = await enrich.deezer(unique_isrcs, setStatus)
+			let mb = await enrich.musicbrainz(unique_isrcs, setStatus)
+			let unique_mbids = Object.values(mb).map(v => v.mbid).filter(Boolean)
+			let ab = await enrich.acousticbrainz(unique_mbids, setStatus)
+			return { deezer, mb, ab }
+		}).catch(e => { // any unhandled throw in the chain shouldn't kill the whole export
+			enrich.warn('Enrichment phase failed unexpectedly (' + e.message + '); CSV will export without enriched columns.')
+			return { deezer: {}, mb: {}, ab: {} }
 		})
 
 		// join the tables, label the columns, and put all data in a single csv string
-		return Promise.all([data_promise, genre_promise, album_promise, features_promise]).then(values => {
-			let [data, artist_genres, record_labels, features] = values
+		return Promise.all([data_promise, genre_promise, album_promise, enrich_promise]).then(values => {
+			let [data, artist_genres, record_labels, enriched] = values
+			setStatus?.('Building CSV')
 			data = data.flat() // get rid of the batch dimension (only 100 songs per call)
 			data.forEach(row => {
 				// add genres
@@ -282,12 +474,23 @@ let PlaylistExporter = {
 				// add album details
 				let album_id = row.shift()
 				row.push('"'+record_labels[album_id]+'"')
+				// add enrichment columns (ISRC + Deezer + MusicBrainz + AcousticBrainz)
+				let uri = row[0]
+				let isrc = track_isrcs[uri]
+				let d = isrc ? enriched.deezer[isrc] : null
+				let m = isrc ? enriched.mb[isrc] : null
+				let a = m?.mbid ? enriched.ab[m.mbid] : null
+				row.push(enrich.csvField(isrc))
+				row.push(enrich.csvField(d?.bpm), enrich.csvField(d?.gain))
+				row.push(enrich.csvField(m?.mbid), enrich.csvField(m?.tags))
+				row.push(enrich.csvField(a?.bpm), enrich.csvField(a?.key), enrich.csvField(a?.avg_loudness), enrich.csvField(a?.dynamic_complexity),
+					enrich.csvField(a?.danceability), enrich.csvField(a?.mood_happy), enrich.csvField(a?.mood_sad),
+					enrich.csvField(a?.mood_aggressive), enrich.csvField(a?.mood_relaxed), enrich.csvField(a?.mood_party),
+					enrich.csvField(a?.voice_instrumental), enrich.csvField(a?.tonal_atonal), enrich.csvField(a?.timbre),
+					enrich.csvField(a?.genre_dortmund), enrich.csvField(a?.genre_rosamerica), enrich.csvField(a?.gender))
 			})
-			// add features
-			features = features.flat() // get rid of the batch dimension (only 100 songs per call)
-			data.forEach((row, i) => features[i]?.forEach(feat => row.push(feat)))
 			// make a string
-			let csv = "Track URI,Track Name,Album Name,Artist Name(s),Release Date,Duration (ms),Popularity,Explicit,Added By,Added At,Genres,Record Label,Danceability,Energy,Key,Loudness,Mode,Speechiness,Acousticness,Instrumentalness,Liveness,Valence,Tempo,Time Signature\n"
+			let csv = "Track URI,Track Name,Album Name,Artist Name(s),Release Date,Duration (ms),Popularity,Explicit,Added By,Added At,Genres,Record Label,ISRC,Deezer BPM,Deezer Gain,MB Recording ID,MB Tags,AB BPM,AB Key,AB Average Loudness,AB Dynamic Complexity,AB Danceability,AB Mood Happy,AB Mood Sad,AB Mood Aggressive,AB Mood Relaxed,AB Mood Party,AB Voice/Instrumental,AB Tonal/Atonal,AB Timbre,AB Genre (Dortmund),AB Genre (Rosamerica),AB Gender\n"
 			data.forEach(row => { csv += row.join(",") + "\n" })
 			return csv
 		})
@@ -300,8 +503,9 @@ onload = async () => {
 	if (code) {
 		history.replaceState({}, '', '/') // get rid of the ugly code string from the browser bar
 
+		let client_id = window.CONFIG?.spotify_client_id || "d99b082b01d74d61a100c9a0e056380b"
 		let response = await fetch("https://accounts.spotify.com/api/token", { method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-			body: new URLSearchParams({client_id: "d99b082b01d74d61a100c9a0e056380b", grant_type: 'authorization_code', code: code, redirect_uri: location.origin,
+			body: new URLSearchParams({client_id: client_id, grant_type: 'authorization_code', code: code, redirect_uri: location.origin,
 				code_verifier: localStorage.getItem('code_verifier')}) }) // POST to get the access token, then fish it out of the response body
 		localStorage.setItem('access_token', (await response.json()).access_token) // https://stackoverflow.com/questions/59555534/why-is-json-asynchronous
 		localStorage.setItem('access_token_timestamp', Date.now())
